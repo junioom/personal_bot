@@ -1,17 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         BOT TELEGRAM - ASSISTENTE DE FINANÇAS PESSOAIS          ║
-║         Arquitetura: Flask + Webhook (compatível com Render)    ║
+║         Arquitetura: Flask + Webhook + Comandos diretos         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-⚠️  DIFERENÇA CHAVE vs versão anterior:
-    - ANTES: app.run_polling() → loop infinito, Render derruba o processo
-    - AGORA: Flask + Webhook → servidor HTTP ativo, Telegram envia as
-             mensagens para a URL, igual ao seu bot de dutching.
+SEM dependência de LLM (OpenAI, etc.) — zero custo de API.
+Os dados vêm direto do Google Sheets via gspread + pandas.
+
+Comandos disponíveis:
+  /total (mes)                    → todos os gastos do mês + soma final
+  /categoria (categoria) (mes)    → gastos de uma categoria no mês + soma
+
+Exemplos:
+  /total maio
+  /total 05
+  /categoria alimentacao abril
+  /categoria transporte 03
 
 Variáveis de ambiente necessárias:
   TELEGRAM_TOKEN              → Token do BotFather
-  OPENAI_API_KEY              → Chave da OpenAI
   GOOGLE_SHEETS_ID            → ID da planilha (na URL)
   GOOGLE_SERVICE_ACCOUNT_JSON → Conteúdo JSON das credenciais do Google Cloud
   WEBHOOK_URL                 → URL pública do Render (ex: https://meubot.onrender.com)
@@ -27,17 +34,10 @@ import gspread
 from flask import Flask, request
 from google.oauth2.service_account import Credentials
 
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import Tool
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
 )
 
@@ -52,15 +52,68 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════
-# BLOCO 1: LEITURA DA PLANILHA GOOGLE SHEETS
+# BLOCO 1: MAPEAMENTO DE MESES
+# ══════════════════════════════════════════════
+
+# Aceita tanto nome ("janeiro", "jan") quanto número ("01", "1")
+MESES_NOMES = {
+    "janeiro": 1,  "jan": 1,
+    "fevereiro": 2, "fev": 2,
+    "março": 3,    "mar": 3,  "marco": 3,
+    "abril": 4,    "abr": 4,
+    "maio": 5,     "mai": 5,
+    "junho": 6,    "jun": 6,
+    "julho": 7,    "jul": 7,
+    "agosto": 8,   "ago": 8,
+    "setembro": 9, "set": 9,
+    "outubro": 10, "out": 10,
+    "novembro": 11,"nov": 11,
+    "dezembro": 12,"dez": 12,
+}
+
+MESES_EXTENSO = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março",
+    4: "Abril",   5: "Maio",      6: "Junho",
+    7: "Julho",   8: "Agosto",    9: "Setembro",
+    10: "Outubro",11: "Novembro", 12: "Dezembro",
+}
+
+def resolver_mes(texto: str) -> int | None:
+    """
+    Converte uma string de mês para número inteiro (1–12).
+
+    Aceita:
+      - Nome completo: "janeiro", "fevereiro" ...
+      - Abreviação: "jan", "fev" ...
+      - Número: "1", "01", "12" ...
+
+    Retorna None se não conseguir identificar o mês.
+    """
+    texto = texto.strip().lower()
+
+    # Tenta pelo nome/abreviação
+    if texto in MESES_NOMES:
+        return MESES_NOMES[texto]
+
+    # Tenta como número
+    try:
+        num = int(texto)
+        if 1 <= num <= 12:
+            return num
+    except ValueError:
+        pass
+
+    return None
+
+
+# ══════════════════════════════════════════════
+# BLOCO 2: LEITURA DA PLANILHA GOOGLE SHEETS
 # ══════════════════════════════════════════════
 
 def obter_credenciais_google() -> Credentials:
     """
     Cria as credenciais do Google a partir da variável de ambiente.
-
-    Usa arquivo temporário para não depender de arquivos fixos em disco
-    no servidor do Render (que tem filesystem efêmero).
+    Usa arquivo temporário para não depender de arquivos fixos em disco.
     """
     json_content = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not json_content:
@@ -77,14 +130,14 @@ def obter_credenciais_google() -> Credentials:
         ]
         credenciais = Credentials.from_service_account_file(tmp_path, scopes=scopes)
     finally:
-        os.unlink(tmp_path)  # Apaga o arquivo temporário imediatamente
+        os.unlink(tmp_path)
 
     return credenciais
 
 
-def baixar_dados_planilha() -> pd.DataFrame:
+def carregar_planilha() -> pd.DataFrame:
     """
-    Conecta ao Google Sheets e retorna os dados como DataFrame do Pandas.
+    Conecta ao Google Sheets e retorna os dados como DataFrame.
 
     Colunas esperadas (nomes EXATOS):
       - Carimbo de data/hora
@@ -92,26 +145,22 @@ def baixar_dados_planilha() -> pd.DataFrame:
       - Quanto custou?
       - Quando foi?
       - Descrição do que foi
-    """
-    logger.info("Conectando ao Google Sheets...")
 
+    Já aplica limpeza e tipagem nos dados retornados.
+    """
     credenciais = obter_credenciais_google()
     cliente = gspread.authorize(credenciais)
 
     sheet_id = os.environ.get("GOOGLE_SHEETS_ID")
-    if not sheet_id:
-        raise ValueError("Variável GOOGLE_SHEETS_ID não encontrada.")
-
     planilha = cliente.open_by_key(sheet_id)
     aba = planilha.sheet1
 
-    dados = aba.get_all_records()
-    df = pd.DataFrame(dados)
+    df = pd.DataFrame(aba.get_all_records())
 
     if df.empty:
         return df
 
-    # Converte coluna de valor para numérico (remove R$, vírgulas etc.)
+    # Limpa e converte coluna de valor para float
     if "Quanto custou?" in df.columns:
         df["Quanto custou?"] = (
             df["Quanto custou?"]
@@ -121,284 +170,360 @@ def baixar_dados_planilha() -> pd.DataFrame:
         )
         df["Quanto custou?"] = pd.to_numeric(df["Quanto custou?"], errors="coerce")
 
-    # Converte coluna de data para datetime (permite filtros por período)
+    # Converte coluna de data para datetime
     if "Quando foi?" in df.columns:
         df["Quando foi?"] = pd.to_datetime(
             df["Quando foi?"], dayfirst=True, errors="coerce"
         )
 
-    logger.info(f"Planilha carregada: {len(df)} registros encontrados.")
+    logger.info(f"Planilha carregada: {len(df)} registros.")
     return df
 
 
-# ══════════════════════════════════════════════
-# BLOCO 2: FERRAMENTA DO AGENTE (Tool)
-# ══════════════════════════════════════════════
-
-def consultar_planilha(pergunta: str) -> str:
+def filtrar_por_mes(df: pd.DataFrame, numero_mes: int) -> pd.DataFrame:
     """
-    Ferramenta principal do agente LangChain.
-
-    Baixa os dados da planilha, monta um resumo estruturado
-    (totais, categorias, meses, últimas transações) e retorna
-    como texto para o agente formular a resposta final.
+    Filtra o DataFrame mantendo apenas os registros do mês informado.
+    O ano não é filtrado — considera todos os anos com aquele mês.
     """
-    try:
-        df = baixar_dados_planilha()
+    if "Quando foi?" not in df.columns:
+        return pd.DataFrame()
 
-        if df.empty:
-            return "A planilha está vazia ou não foi possível carregar os dados."
-
-        total_geral = df["Quanto custou?"].sum() if "Quanto custou?" in df.columns else 0
-        num_registros = len(df)
-
-        # Agrupamento por categoria
-        resumo_categorias = ""
-        if "Qual a categoria do Gasto?" in df.columns:
-            por_categoria = (
-                df.groupby("Qual a categoria do Gasto?")["Quanto custou?"]
-                .agg(["sum", "count"])
-                .rename(columns={"sum": "Total (R$)", "count": "Qtd"})
-                .sort_values("Total (R$)", ascending=False)
-            )
-            resumo_categorias = por_categoria.to_string()
-
-        # Agrupamento por mês
-        resumo_mensal = ""
-        if "Quando foi?" in df.columns and df["Quando foi?"].notna().any():
-            df["Mês"] = df["Quando foi?"].dt.to_period("M").astype(str)
-            por_mes = (
-                df.groupby("Mês")["Quanto custou?"]
-                .sum()
-                .sort_index()
-            )
-            resumo_mensal = por_mes.to_string()
-
-        # Últimas 10 transações para dar contexto ao agente
-        cols_exibir = [c for c in [
-            "Quando foi?", "Qual a categoria do Gasto?",
-            "Quanto custou?", "Descrição do que foi"
-        ] if c in df.columns]
-        ultimas = df[cols_exibir].tail(10).to_string(index=False)
-
-        contexto = f"""
-DADOS DA PLANILHA DE GASTOS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total de registros: {num_registros}
-Total geral gasto: R$ {total_geral:.2f}
-
-GASTOS POR CATEGORIA:
-{resumo_categorias if resumo_categorias else "Coluna de categoria não encontrada."}
-
-GASTOS POR MÊS:
-{resumo_mensal if resumo_mensal else "Coluna de data inválida ou não encontrada."}
-
-ÚLTIMAS 10 TRANSAÇÕES:
-{ultimas}
-
-PERGUNTA DO USUÁRIO: {pergunta}
-"""
-        return contexto.strip()
-
-    except Exception as e:
-        logger.error(f"Erro ao consultar planilha: {e}")
-        return f"Erro ao acessar a planilha: {str(e)}"
+    return df[df["Quando foi?"].dt.month == numero_mes].copy()
 
 
 # ══════════════════════════════════════════════
-# BLOCO 3: CONFIGURAÇÃO DO AGENTE LANGCHAIN
+# BLOCO 3: FORMATAÇÃO DAS RESPOSTAS
 # ══════════════════════════════════════════════
 
-def criar_agente() -> AgentExecutor:
-    """
-    Cria o ReAct Agent do LangChain com a ferramenta de planilha.
+def formatar_valor(valor: float) -> str:
+    """Formata um float como moeda brasileira: R$ 1.234,56"""
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    ReAct = Reasoning + Acting:
-      1. PENSA sobre a pergunta (Thought)
-      2. DECIDE qual ferramenta usar (Action)
-      3. OBSERVA o resultado (Observation)
-      4. Repete até chegar na resposta final
-    """
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        openai_api_key=os.environ.get("OPENAI_API_KEY"),
-    )
 
-    ferramentas = [
-        Tool(
-            name="consultar_planilha",
-            func=consultar_planilha,
-            description=(
-                "Use esta ferramenta SEMPRE que o usuário perguntar sobre gastos, "
-                "finanças, categorias, valores, datas ou qualquer informação financeira. "
-                "Passe a pergunta do usuário como entrada. "
-                "Ela retorna dados reais da planilha do Google Sheets."
-            ),
+def montar_lista_gastos(df: pd.DataFrame) -> str:
+    """
+    Monta a lista de gastos linha a linha no formato:
+      📅 DD/MM  |  🏷 Categoria  |  📝 Descrição  |  💸 R$ X,XX
+
+    Retorna a lista formatada + linha de total no final.
+    """
+    if df.empty:
+        return ""
+
+    linhas = []
+    for _, row in df.iterrows():
+        # Data
+        data = row.get("Quando foi?")
+        data_str = data.strftime("%d/%m") if pd.notna(data) else "??/??"
+
+        # Categoria
+        categoria = str(row.get("Qual a categoria do Gasto?", "—")).strip()
+
+        # Descrição
+        descricao = str(row.get("Descrição do que foi", "—")).strip()
+        if not descricao or descricao == "nan":
+            descricao = "—"
+
+        # Valor
+        valor = row.get("Quanto custou?", 0)
+        valor_str = formatar_valor(valor) if pd.notna(valor) else "—"
+
+        linhas.append(
+            f"📅 {data_str}  |  🏷 {categoria}\n"
+            f"   📝 {descricao}\n"
+            f"   💸 {valor_str}"
         )
-    ]
 
-    prompt_template = PromptTemplate.from_template("""
-Você é um assistente financeiro pessoal simpático e preciso chamado FinBot.
-Você tem acesso à planilha de gastos do usuário via ferramentas.
+    total = df["Quanto custou?"].sum()
+    linhas.append(f"\n{'─' * 30}\n💰 *Total: {formatar_valor(total)}*")
 
-SEMPRE que o usuário perguntar sobre gastos, valores, categorias ou datas,
-use a ferramenta 'consultar_planilha' para obter os dados reais antes de responder.
-
-Responda sempre em português brasileiro.
-Seja direto, organize os números de forma clara e use emojis quando apropriado (💰📊📅).
-Formate valores monetários como R$ X.XXX,XX.
-
-Ferramentas disponíveis:
-{tools}
-
-Nomes das ferramentas: {tool_names}
-
-Formato obrigatório de raciocínio:
-Question: a pergunta do usuário
-Thought: meu raciocínio sobre o que fazer
-Action: nome_da_ferramenta
-Action Input: entrada para a ferramenta
-Observation: resultado da ferramenta
-... (repita Thought/Action/Observation se necessário)
-Thought: Agora tenho informação suficiente para responder
-Final Answer: minha resposta final para o usuário
-
-Comece!
-
-Question: {input}
-Thought: {agent_scratchpad}
-""")
-
-    agente = create_react_agent(llm=llm, tools=ferramentas, prompt=prompt_template)
-
-    return AgentExecutor(
-        agent=agente,
-        tools=ferramentas,
-        verbose=True,
-        max_iterations=5,
-        handle_parsing_errors=True,
-    )
+    return "\n\n".join(linhas)
 
 
 # ══════════════════════════════════════════════
-# BLOCO 4: HANDLERS DO TELEGRAM
+# BLOCO 4: HANDLERS DOS COMANDOS
 # ══════════════════════════════════════════════
 
 async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler para /start — apresenta o bot ao usuário."""
+    """Handler para /start — apresenta os comandos disponíveis."""
     nome = update.effective_user.first_name
     mensagem = (
-        f"Olá, {nome}! 👋 Sou seu assistente financeiro pessoal.\n\n"
-        "💬 *Como usar:*\n"
-        "Basta me perguntar em linguagem natural sobre seus gastos!\n\n"
-        "📌 *Exemplos:*\n"
-        "• _Quanto gastei este mês?_\n"
-        "• _Qual categoria tem mais gastos?_\n"
-        "• _Mostre meus gastos com alimentação_\n"
-        "• _Qual foi meu maior gasto em março?_\n\n"
-        "Seus dados vêm direto da sua planilha Google Sheets. 📊"
+        f"Olá, {nome}! 👋 Sou seu assistente de finanças pessoais.\n\n"
+        "📋 *Comandos disponíveis:*\n\n"
+        "*/total (mês)*\n"
+        "Retorna todos os gastos do mês com detalhes e soma final.\n"
+        "_Exemplos: /total maio · /total 05_\n\n"
+        "*/categoria (categoria) (mês)*\n"
+        "Retorna os gastos de uma categoria específica no mês.\n"
+        "_Exemplos: /categoria alimentacao abril · /categoria transporte 04_\n\n"
+        "*/categorias (mês)*\n"
+        "Lista todas as categorias do mês com seus totais.\n"
+        "_Exemplo: /categorias maio_"
     )
     await update.message.reply_text(mensagem, parse_mode="Markdown")
 
 
-async def comando_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler para /ajuda — exibe exemplos de perguntas."""
-    mensagem = (
-        "🤖 *Como funciono:*\n"
-        "Acesso sua planilha de gastos em tempo real e uso IA para responder suas perguntas.\n\n"
-        "💡 *Perguntas que você pode fazer:*\n"
-        "• Total gasto por categoria\n"
-        "• Comparação entre meses\n"
-        "• Gastos em um período específico\n"
-        "• Qual foi o gasto mais alto\n"
-        "• Resumo financeiro do mês\n\n"
-        "⚡ _Dica: Seja específico! Ex: 'quanto gastei com transporte em abril'_"
-    )
-    await update.message.reply_text(mensagem, parse_mode="Markdown")
-
-
-async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def comando_total(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handler principal para mensagens de texto.
+    Handler para /total (mes).
 
-    Recebe a pergunta, passa para o agente LangChain (que consulta
-    a planilha se necessário) e devolve a resposta ao usuário.
+    Uso: /total maio  ou  /total 05
+
+    Retorna todos os gastos do mês informado, um por linha,
+    com data, categoria, descrição e valor — seguido da soma total.
     """
-    pergunta = update.message.text
-    logger.info(f"Mensagem: {pergunta[:60]}...")
+    # ── Valida o argumento de mês ────────────────────────────────
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Informe o mês.\n_Exemplo: /total maio  ou  /total 05_",
+            parse_mode="Markdown"
+        )
+        return
 
-    # Mostra "digitando..." enquanto a IA processa
+    numero_mes = resolver_mes(context.args[0])
+    if numero_mes is None:
+        await update.message.reply_text(
+            "❌ Mês não reconhecido. Use o nome (maio) ou número (05)."
+        )
+        return
+
+    nome_mes = MESES_EXTENSO[numero_mes]
     await update.message.chat.send_action("typing")
 
     try:
-        resultado = agente_executor.invoke({"input": pergunta})
-        resposta = resultado.get("output", "Não consegui processar sua pergunta.")
+        df = carregar_planilha()
+
+        if df.empty:
+            await update.message.reply_text("⚠️ A planilha está vazia.")
+            return
+
+        df_mes = filtrar_por_mes(df, numero_mes)
+
+        if df_mes.empty:
+            await update.message.reply_text(
+                f"📭 Nenhum gasto encontrado em *{nome_mes}*.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Ordena por data para exibição cronológica
+        df_mes = df_mes.sort_values("Quando foi?")
+
+        cabecalho = f"📊 *Gastos de {nome_mes}* ({len(df_mes)} registros)\n{'─' * 30}\n\n"
+        lista = montar_lista_gastos(df_mes)
+        resposta = cabecalho + lista
+
+        # Telegram tem limite de 4096 caracteres por mensagem
+        # Se passar, divide em partes
+        if len(resposta) <= 4096:
+            await update.message.reply_text(resposta, parse_mode="Markdown")
+        else:
+            # Envia o cabeçalho + lista sem o total primeiro
+            partes = [resposta[i:i+4000] for i in range(0, len(resposta), 4000)]
+            for parte in partes:
+                await update.message.reply_text(parte, parse_mode="Markdown")
+
     except Exception as e:
-        logger.error(f"Erro no agente: {e}")
-        resposta = (
-            "⚠️ Ocorreu um erro ao processar sua pergunta.\n"
-            f"_Detalhe: {str(e)[:120]}_"
+        logger.error(f"Erro no /total: {e}")
+        await update.message.reply_text(
+            f"❌ Erro ao consultar a planilha.\n_Detalhe: {str(e)[:100]}_",
+            parse_mode="Markdown"
         )
 
-    await update.message.reply_text(resposta, parse_mode="Markdown")
+
+async def comando_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler para /categoria (categoria) (mes).
+
+    Uso: /categoria alimentacao maio  ou  /categoria transporte 04
+
+    A busca por categoria é parcial e sem acento — "alimenta" encontra
+    "Alimentação", "trans" encontra "Transporte", etc.
+    """
+    # ── Valida os argumentos ─────────────────────────────────────
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Uso correto: /categoria (categoria) (mês)\n"
+            "_Exemplo: /categoria alimentacao maio_",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Último argumento é o mês, tudo antes é a categoria
+    # (permite categorias com espaço: /categoria vale refeicao maio)
+    texto_mes = context.args[-1]
+    texto_categoria = " ".join(context.args[:-1])
+
+    numero_mes = resolver_mes(texto_mes)
+    if numero_mes is None:
+        await update.message.reply_text(
+            "❌ Mês não reconhecido. Use o nome (maio) ou número (05)."
+        )
+        return
+
+    nome_mes = MESES_EXTENSO[numero_mes]
+    await update.message.chat.send_action("typing")
+
+    try:
+        df = carregar_planilha()
+
+        if df.empty:
+            await update.message.reply_text("⚠️ A planilha está vazia.")
+            return
+
+        df_mes = filtrar_por_mes(df, numero_mes)
+
+        if df_mes.empty:
+            await update.message.reply_text(
+                f"📭 Nenhum gasto encontrado em *{nome_mes}*.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # ── Busca parcial sem acento na categoria ────────────────
+        # Normaliza texto para comparação (remove acentos e caixa)
+        import unicodedata
+
+        def normalizar(texto: str) -> str:
+            return unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode().lower()
+
+        busca = normalizar(texto_categoria)
+        col_cat = "Qual a categoria do Gasto?"
+
+        mascara = df_mes[col_cat].astype(str).apply(normalizar).str.contains(busca, na=False)
+        df_filtrado = df_mes[mascara].sort_values("Quando foi?")
+
+        if df_filtrado.empty:
+            # Mostra as categorias disponíveis para ajudar o usuário
+            categorias_disponiveis = sorted(df_mes[col_cat].dropna().unique())
+            cats_str = "\n".join(f"  • {c}" for c in categorias_disponiveis)
+            await update.message.reply_text(
+                f"📭 Nenhum gasto com categoria *{texto_categoria}* em *{nome_mes}*.\n\n"
+                f"Categorias disponíveis neste mês:\n{cats_str}",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Pega o nome real da categoria (como está na planilha)
+        nome_categoria_real = df_filtrado[col_cat].iloc[0]
+
+        cabecalho = (
+            f"🏷 *{nome_categoria_real}* — {nome_mes}\n"
+            f"({len(df_filtrado)} registros)\n"
+            f"{'─' * 30}\n\n"
+        )
+        lista = montar_lista_gastos(df_filtrado)
+        resposta = cabecalho + lista
+
+        if len(resposta) <= 4096:
+            await update.message.reply_text(resposta, parse_mode="Markdown")
+        else:
+            partes = [resposta[i:i+4000] for i in range(0, len(resposta), 4000)]
+            for parte in partes:
+                await update.message.reply_text(parte, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Erro no /categoria: {e}")
+        await update.message.reply_text(
+            f"❌ Erro ao consultar a planilha.\n_Detalhe: {str(e)[:100]}_",
+            parse_mode="Markdown"
+        )
+
+
+async def comando_categorias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler para /categorias (mes).
+
+    Bônus útil: lista todas as categorias do mês com o total de cada uma,
+    para o usuário saber quais nomes usar no /categoria.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Informe o mês.\n_Exemplo: /categorias maio_",
+            parse_mode="Markdown"
+        )
+        return
+
+    numero_mes = resolver_mes(context.args[0])
+    if numero_mes is None:
+        await update.message.reply_text(
+            "❌ Mês não reconhecido. Use o nome (maio) ou número (05)."
+        )
+        return
+
+    nome_mes = MESES_EXTENSO[numero_mes]
+    await update.message.chat.send_action("typing")
+
+    try:
+        df = carregar_planilha()
+        df_mes = filtrar_por_mes(df, numero_mes)
+
+        if df_mes.empty:
+            await update.message.reply_text(
+                f"📭 Nenhum gasto encontrado em *{nome_mes}*.",
+                parse_mode="Markdown"
+            )
+            return
+
+        col_cat = "Qual a categoria do Gasto?"
+        resumo = (
+            df_mes.groupby(col_cat)["Quanto custou?"]
+            .agg(["sum", "count"])
+            .sort_values("sum", ascending=False)
+        )
+
+        total_geral = df_mes["Quanto custou?"].sum()
+        linhas = [f"📊 *Categorias de {nome_mes}*\n{'─' * 30}\n"]
+
+        for categoria, row in resumo.iterrows():
+            linhas.append(
+                f"🏷 *{categoria}*\n"
+                f"   {int(row['count'])} gasto(s) · {formatar_valor(row['sum'])}"
+            )
+
+        linhas.append(f"\n{'─' * 30}\n💰 *Total geral: {formatar_valor(total_geral)}*")
+        resposta = "\n\n".join(linhas)
+
+        await update.message.reply_text(resposta, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Erro no /categorias: {e}")
+        await update.message.reply_text(
+            f"❌ Erro ao consultar a planilha.\n_Detalhe: {str(e)[:100]}_",
+            parse_mode="Markdown"
+        )
 
 
 # ══════════════════════════════════════════════
 # BLOCO 5: FLASK + WEBHOOK (compatível Render)
 # ══════════════════════════════════════════════
-#
-# POR QUE ISSO FUNCIONA NO RENDER:
-#   O Render exige que a aplicação suba um servidor HTTP na porta
-#   fornecida pela variável PORT. Com run_polling() isso não acontecia.
-#   Aqui o Flask sobe o servidor, e o Telegram chama nosso /webhook
-#   a cada mensagem recebida — o mesmo padrão do seu bot de dutching.
-# ──────────────────────────────────────────────
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-# Servidor HTTP Flask
 flask_app = Flask(__name__)
-
-# App do Telegram (sem iniciar polling)
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 
-# Registra os handlers de comandos e mensagens
-telegram_app.add_handler(CommandHandler("start", comando_start))
-telegram_app.add_handler(CommandHandler("ajuda", comando_ajuda))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_mensagem))
+# Registra todos os comandos
+telegram_app.add_handler(CommandHandler("start",      comando_start))
+telegram_app.add_handler(CommandHandler("total",      comando_total))
+telegram_app.add_handler(CommandHandler("categoria",  comando_categoria))
+telegram_app.add_handler(CommandHandler("categorias", comando_categorias))
 
-# ── Inicializa o bot UMA única vez com asyncio ──────────────────
-# Mesmo padrão exato do seu bot de dutching que já funciona no Render
+# Inicializa o bot com asyncio (mesmo padrão do bot de dutching)
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 loop.run_until_complete(telegram_app.initialize())
 loop.run_until_complete(telegram_app.start())
 
-# Inicializa o agente LangChain uma única vez na subida do servidor
-logger.info("Inicializando agente LangChain...")
-agente_executor = criar_agente()
-logger.info("Agente criado com sucesso!")
-
 
 @flask_app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    """
-    Endpoint que recebe as atualizações do Telegram.
-
-    O Telegram chama esta URL via HTTPS cada vez que alguém manda
-    uma mensagem para o bot. O TOKEN na URL serve como segurança
-    básica: só quem conhece a URL consegue chamar o endpoint.
-    """
+    """Recebe as atualizações do Telegram e processa de forma assíncrona."""
     try:
         data = request.get_json()
         update = Update.de_json(data, telegram_app.bot)
-
-        # Processa o update no loop asyncio já existente
         loop.run_until_complete(telegram_app.process_update(update))
-
         return "ok", 200
-
     except Exception as e:
         logger.error(f"Erro no webhook: {e}")
         return "error", 500
@@ -406,32 +531,21 @@ def webhook():
 
 @flask_app.route("/")
 def home():
-    """Rota raiz — confirma que o servidor está no ar."""
     return "✅ FinBot rodando!", 200
 
 
 @flask_app.route("/set_webhook")
 def set_webhook():
     """
-    Rota auxiliar para registrar o webhook no Telegram.
-
-    ▶️  Acesse esta URL UMA VEZ pelo navegador após o deploy:
-        https://SEU-APP.onrender.com/set_webhook
-
-    Isso diz ao Telegram para qual URL ele deve enviar as mensagens.
-    Só é necessário fazer isso uma vez (ou se mudar a URL do Render).
+    Acesse esta URL UMA VEZ após o deploy para registrar o webhook:
+    https://SEU-APP.onrender.com/set_webhook
     """
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     url_completa = f"{webhook_url}/webhook/{TOKEN}"
-
-    result = loop.run_until_complete(
-        telegram_app.bot.set_webhook(url=url_completa)
-    )
-
+    result = loop.run_until_complete(telegram_app.bot.set_webhook(url=url_completa))
     if result:
         return f"✅ Webhook registrado!\nURL: {url_completa}", 200
-    else:
-        return "❌ Falha ao registrar webhook. Verifique WEBHOOK_URL.", 500
+    return "❌ Falha. Verifique WEBHOOK_URL.", 500
 
 
 # ══════════════════════════════════════════════
@@ -439,11 +553,5 @@ def set_webhook():
 # ══════════════════════════════════════════════
 
 if __name__ == "__main__":
-    """
-    Inicia o servidor Flask.
-
-    O Render injeta a porta automaticamente via variável PORT.
-    host="0.0.0.0" é obrigatório para o Render conseguir acessar.
-    """
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port)

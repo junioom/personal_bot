@@ -1,27 +1,15 @@
-# ──────────────────────────────────────────────────────────────
-# requirements.txt — Bot Telegram de Finanças Pessoais com IA
-# ──────────────────────────────────────────────────────────────
-
-# Servidor HTTP (obrigatório para Render/Railway — substitui o run_polling)
+# Servidor HTTP (obrigatório para Render — substitui o run_polling)
 flask==3.0.3
 
-# Interface com o Telegram (versão 20+ usa arquitetura assíncrona)
+# Interface com o Telegram (v20+ assíncrona)
 python-telegram-bot==20.7
 
-# Google Sheets: autenticação e leitura de planilhas
+# Google Sheets: autenticação e leitura
 gspread==6.1.2
 google-auth==2.29.0
 
-# Manipulação de dados financeiros
+# Manipulação dos dados da planilha
 pandas==2.2.2
 
-# LangChain: framework do agente ReAct
-langchain==0.2.5
-langchain-openai==0.1.8
-langchain-community==0.2.5
-
-# OpenAI (LLM base do agente)
-openai==1.30.5
-
-# Utilitários
-python-dotenv==1.0.1   # Para carregar .env em desenvolvimento local
+# Utilitário para carregar .env em desenvolvimento local
+python-dotenv==1.0.1
