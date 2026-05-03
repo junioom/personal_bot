@@ -449,3 +449,26 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+import os
+from flask import Flask
+import threading
+
+# Cria um mini servidor web fantasma
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is running", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+if __name__ == "__main__":
+    # Roda o servidor web em uma thread separada
+    threading.Thread(target=run_web, daemon=True).start()
+    
+    # Aqui vai o comando que inicia seu bot (exemplo):
+    # seu_bot.run_polling() 
+    print("Bot iniciado...")
