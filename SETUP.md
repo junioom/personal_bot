@@ -24,21 +24,9 @@ telegram-finance-bot/
 
 ---
 
-## 🧠 Passo 2 — Obter a Chave da OpenAI
+## 📊 Passo 2 — Configurar o Google Sheets
 
-1. Acesse [platform.openai.com](https://platform.openai.com)
-2. Vá em **API Keys** → **Create new secret key**
-3. Copie a chave (começa com `sk-...`)
-4. Guarde como variável de ambiente: `OPENAI_API_KEY`
-
-> 💡 O bot usa `gpt-4o-mini` por padrão (barato e eficiente).
-> Troque para `gpt-4o` em `main.py` se quiser mais precisão.
-
----
-
-## 📊 Passo 3 — Configurar o Google Sheets
-
-### 3.1 — Criar o projeto no Google Cloud
+### 2.1 — Criar o projeto no Google Cloud
 
 1. Acesse [console.cloud.google.com](https://console.cloud.google.com)
 2. Crie um novo projeto (ex: `finance-bot`)
@@ -47,7 +35,7 @@ telegram-finance-bot/
    - ✅ **Google Sheets API**
    - ✅ **Google Drive API**
 
-### 3.2 — Criar a Conta de Serviço
+### 2.2 — Criar a Conta de Serviço
 
 1. Vá em **APIs e serviços** → **Credenciais**
 2. Clique em **+ Criar credenciais** → **Conta de serviço**
@@ -56,7 +44,7 @@ telegram-finance-bot/
 5. **Adicionar chave** → **Criar nova chave** → **JSON**
 6. O arquivo `.json` será baixado automaticamente
 
-### 3.3 — Configurar a variável de ambiente
+### 2.3 — Configurar a variável de ambiente
 
 Abra o arquivo `.json` baixado em um editor de texto.
 Copie **todo o conteúdo** (incluindo as chaves `{}`) e cole como:
@@ -66,14 +54,14 @@ GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 
 > ⚠️ O conteúdo deve ser uma linha só, sem quebras de linha extras.
 
-### 3.4 — Compartilhar a planilha com a Conta de Serviço
+### 2.4 — Compartilhar a planilha com a Conta de Serviço
 
 1. Abra o arquivo `.json` e copie o campo `"client_email"` 
    (algo como `finance-bot-sa@seu-projeto.iam.gserviceaccount.com`)
 2. Abra sua planilha Google Sheets
 3. Clique em **Compartilhar** e adicione esse e-mail com permissão de **Leitor**
 
-### 3.5 — Obter o ID da planilha
+### 2.5 — Obter o ID da planilha
 
 Na URL da planilha:
 ```
@@ -83,7 +71,7 @@ Copie a parte destacada e salve como: `GOOGLE_SHEETS_ID`
 
 ---
 
-## 📋 Passo 4 — Estrutura da Planilha
+## 📋 Passo 3 — Estrutura da Planilha
 
 Sua planilha deve ter exatamente estas colunas (nomes exatos):
 
@@ -99,9 +87,9 @@ Sua planilha deve ter exatamente estas colunas (nomes exatos):
 
 ---
 
-## 🚀 Passo 5 — Deploy no Render.com
+## 🚀 Passo 4 — Deploy no Render.com
 
-### 5.1 — Subir o código para o GitHub
+### 4.1 — Subir o código para o GitHub
 
 ```bash
 git init
@@ -111,7 +99,7 @@ git remote add origin https://github.com/SEU_USUARIO/finance-bot.git
 git push -u origin main
 ```
 
-### 5.2 — Criar o serviço no Render
+### 4.2 — Criar o serviço no Render
 
 1. Acesse [render.com](https://render.com) e faça login
 2. Clique em **New** → **Web Service**
@@ -123,7 +111,7 @@ git push -u origin main
    - **Start Command**: `python main.py`
    - **Instance Type**: `Free` (suficiente para uso pessoal)
 
-### 5.3 — Adicionar variáveis de ambiente no Render
+### 4.3 — Adicionar variáveis de ambiente no Render
 
 Em **Environment** → **Add Environment Variable**, adicione:
 
